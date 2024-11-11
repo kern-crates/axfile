@@ -1,11 +1,13 @@
 //! Low-level filesystem operations.
 
 use axerrno::{ax_err, ax_err_type, AxResult};
-use axfs_vfs::{VfsError, VfsNodeRef};
+use axfs_vfs::{VfsError, VfsNodeRef, VfsNodeType};
 use axio::SeekFrom;
 use capability::{Cap, WithCap};
 use core::fmt;
 use fstree::FsStruct;
+use alloc::collections::BTreeMap;
+use axtype::{O_DIRECTORY, O_NOATIME, O_PATH};
 
 #[cfg(feature = "myfs")]
 pub use crate::dev::Disk;
@@ -18,6 +20,8 @@ pub type FileType = axfs_vfs::VfsNodeType;
 pub type DirEntry = axfs_vfs::VfsDirEntry;
 /// Alias of [`axfs_vfs::VfsNodeAttr`].
 pub type FileAttr = axfs_vfs::VfsNodeAttr;
+/// Alias of [`axfs_vfs::VfsNodeAttrValid`].
+pub type FileAttrValid = axfs_vfs::VfsNodeAttrValid;
 /// Alias of [`axfs_vfs::VfsNodePerm`].
 pub type FilePerm = axfs_vfs::VfsNodePerm;
 
@@ -26,7 +30,31 @@ pub struct File {
     node: WithCap<VfsNodeRef>,
     is_append: bool,
     offset: u64,
+    pub shared_map: BTreeMap<usize, usize>,
 }
+
+/*
+type OpenOp = fn(u32) -> u32;
+type ReadOp = fn(u32, u32) -> u32;
+
+pub struct FileOperations {
+    open: OpenOp,
+    read: ReadOp,
+}
+
+const PIPE_FOPS: FileOperations = FileOperations {
+    open: fifo_open,
+    read: pipe_read,
+};
+
+fn fifo_open(a: u32) -> u32 {
+    0
+}
+
+fn pipe_read(a: u32, b: u32) -> u32 {
+    0
+}
+*/
 
 /// An opened directory object, with open permissions and a cursor for
 /// [`read_dir`](Directory::read_dir).
@@ -47,7 +75,7 @@ pub struct OpenOptions {
     create_new: bool,
     // system-specific
     _custom_flags: i32,
-    _mode: u32,
+    _mode: i32,
 }
 
 impl OpenOptions {
@@ -65,6 +93,15 @@ impl OpenOptions {
             _custom_flags: 0,
             _mode: 0o666,
         }
+    }
+    pub fn set_flags(&mut self, flags: i32) {
+        self._custom_flags = flags;
+    }
+    pub fn set_mode(&mut self, mode: i32) {
+        self._mode = mode;
+    }
+    pub fn mode(&self) -> i32 {
+        self._mode
     }
     /// Sets the option for read access.
     pub fn read(&mut self, read: bool) {
@@ -177,14 +214,28 @@ fn perm_to_cap(perm: FilePerm) -> Cap {
 }
 
 impl File {
-    fn _open_at(dir: Option<&VfsNodeRef>, path: &str, opts: &OpenOptions, fs: &FsStruct) -> AxResult<Self> {
-        debug!("open file: {} {:?}", path, opts);
+    pub fn new(node: VfsNodeRef, cap: Cap) -> Self {
+        Self {
+            node: WithCap::new(node, cap),
+            is_append: false,
+            offset: 0,
+            shared_map: BTreeMap::new(),
+        }
+    }
+
+    pub fn get_ino(&self) -> usize {
+        self.node.access(Cap::empty()).unwrap().get_ino()
+    }
+
+    fn _open_at(dir: Option<&VfsNodeRef>, path: &str, opts: &OpenOptions, fs: &FsStruct, uid: u32, gid: u32) -> AxResult<Self> {
+        info!("open file: {} {:?} flags {:#o}", path, opts, opts._custom_flags);
         if !opts.is_valid() {
             return ax_err!(InvalidInput);
         }
 
-        let node_option = fs.lookup(dir, path);
+        let node_option = fs.lookup(dir, path, opts._custom_flags);
         let node = if opts.create || opts.create_new {
+            info!("create: opts.mode {} {:#o}", path, opts._mode);
             match node_option {
                 Ok(node) => {
                     // already exists
@@ -194,7 +245,7 @@ impl File {
                     node
                 }
                 // not exists, create new
-                Err(VfsError::NotFound) => fs.create_file(dir, path)?,
+                Err(VfsError::NotFound) => fs.create_file(dir, path, VfsNodeType::File, uid, gid, opts._mode)?,
                 Err(e) => return Err(e),
             }
         } else {
@@ -202,32 +253,105 @@ impl File {
             node_option?
         };
 
+        // File has Cap::SET_STAT in default.
+        let access_cap = Cap::SET_STAT | opts.into();
         let attr = node.get_attr()?;
+
+        if (opts._custom_flags & O_NOATIME) != 0 {
+            if attr.uid() != uid {
+                return ax_err!(NoPermission);
+            }
+        }
+        if (opts._custom_flags & O_DIRECTORY) != 0 {
+            if !attr.is_dir() {
+                return ax_err!(NotADirectory);
+            }
+        }
         if attr.is_dir()
             && (opts.create || opts.create_new || opts.write || opts.append || opts.truncate)
         {
             return ax_err!(IsADirectory);
         }
-        let access_cap = opts.into();
-        if !perm_to_cap(attr.perm()).contains(access_cap) {
-            return ax_err!(PermissionDenied);
-        }
 
-        node.open()?;
+        let mut mask = Self::cap_to_linux_mask(access_cap);
+        if opts.create || opts.create_new {
+            mask = 0;
+        }
+        Self::may_open(mask, uid, gid, attr)?;
+
+        node.open(opts._custom_flags)?;
         if opts.truncate {
             node.truncate(0)?;
         }
+
+        let cap = if (opts._custom_flags & O_PATH) != 0 {
+            Cap::empty()
+        } else {
+            access_cap
+        };
+
         Ok(Self {
-            node: WithCap::new(node, access_cap),
+            node: WithCap::new(node, cap),
             is_append: opts.append,
             offset: 0,
+            shared_map: BTreeMap::new(),
         })
+    }
+
+    fn cap_to_linux_mask(cap: Cap) -> u32 {
+        let mut ret: u32 = 0;
+        if cap.contains(Cap::READ) {
+            ret |= 0o4;
+        }
+        if cap.contains(Cap::WRITE) {
+            ret |= 0o2;
+        }
+        if cap.contains(Cap::EXECUTE) {
+            ret |= 0o1;
+        }
+        ret
+    }
+
+    fn may_open(mask: u32, uid: u32, gid: u32, attr: FileAttr) -> AxResult {
+        let fsuid = attr.uid();
+        let fsgid = attr.gid();
+        let mut mode = attr.perm().mode();
+        info!("may_open: mask {:#o} uid {:#x}, gid {:#x}, fsuid {:#x} fsgid {:#x} mode {:#o}",
+            mask, uid, gid, fsuid, fsgid, mode);
+
+        if attr.is_symlink() {
+            return ax_err!(TooManyLinks);
+        }
+
+        // Are we the owner? If so, ACL's don't matter.
+        if uid == fsuid {
+            mode >>= 6;
+            if (mask & !mode) != 0 {
+                return ax_err!(PermDenied);
+            }
+            return Ok(());
+        }
+
+        //
+        // Are the group permissions different from
+        // the other permissions in the bits we care
+        // about? Need to check group ownership if so.
+        //
+        if (mask & (mode ^ (mode >> 3))) != 0 {
+            mode >>= 3;
+        }
+
+        // Bits in 'mode' clear that we require?
+        if (mask & !mode) != 0 {
+            return ax_err!(PermDenied);
+        }
+        return Ok(());
     }
 
     /// Opens a file at the path relative to the current directory. Returns a
     /// [`File`] object.
-    pub fn open(path: &str, opts: &OpenOptions, fs: &FsStruct) -> AxResult<Self> {
-        Self::_open_at(None, path, opts, fs)
+    pub fn open(path: &str, opts: &OpenOptions, fs: &FsStruct, uid: u32, gid: u32) -> AxResult<Self> {
+        Self::_open_at(None, path, opts, fs, uid, gid)
     }
 
     /// Truncates the file to the specified size.
@@ -236,12 +360,26 @@ impl File {
         Ok(())
     }
 
+    /// Gets all entries from dir.
+    pub fn getdents(&mut self, buf: &mut [u8]) -> AxResult<usize> {
+        let node = self.node.access(Cap::READ)?;
+        if !node.get_attr()?.is_dir() {
+            return ax_err!(NotADirectory);
+        }
+        let read_len = node.getdents(self.offset, buf)?;
+        self.offset += read_len as u64;
+        Ok(read_len)
+    }
+
     /// Reads the file at the current position. Returns the number of bytes
     /// read.
     ///
     /// After the read, the cursor will be advanced by the number of bytes read.
     pub fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
         let node = self.node.access(Cap::READ)?;
+        if node.get_attr()?.is_dir() {
+            return ax_err!(IsADirectory);
+        }
         let read_len = node.read_at(self.offset, buf)?;
         self.offset += read_len as u64;
         Ok(read_len)
@@ -252,8 +390,10 @@ impl File {
     /// It does not update the file cursor.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> AxResult<usize> {
         let node = self.node.access(Cap::READ)?;
-        let read_len = node.read_at(offset, buf)?;
-        Ok(read_len)
+        if node.get_attr()?.is_dir() {
+            return ax_err!(IsADirectory);
+        }
+        node.read_at(offset, buf)
     }
 
     /// Writes the file at the current position. Returns the number of bytes
@@ -283,8 +423,11 @@ impl File {
 
     /// Flushes the file, writes all buffered data to the underlying device.
     pub fn flush(&self) -> AxResult {
-        self.node.access(Cap::WRITE)?.fsync()?;
-        Ok(())
+        self.node.access(Cap::WRITE)?.fsync()
+    }
+
+    pub fn ioctl(&self, req: usize, data: usize) -> AxResult<usize> {
+        self.node.access(Cap::empty())?.ioctl(req, data)
     }
 
     /// Sets the cursor of the file to the specified offset. Returns the new
@@ -305,6 +448,20 @@ impl File {
     pub fn get_attr(&self) -> AxResult<FileAttr> {
         self.node.access(Cap::empty())?.get_attr()
     }
+
+    /// Sets the file attributes.
+    pub fn set_attr(&self, attr: &FileAttr, valid: &FileAttrValid) -> AxResult {
+        self.node.access(Cap::SET_STAT)?.set_attr(attr, valid)
+    }
+
+    /// Gets the file cap.
+    pub fn get_cap(&self) -> Cap {
+        self.node.cap()
+    }
+
+    pub fn get_node(&self) -> AxResult<VfsNodeRef> {
+        Ok(self.node.access(Cap::empty())?.clone())
+    }
 }
 
 impl Directory {
@@ -317,7 +474,7 @@ impl Directory {
             return ax_err!(InvalidInput);
         }
 
-        let node = fs.lookup(dir, path)?;
+        let node = fs.lookup(dir, path, 0)?;
         let attr = node.get_attr()?;
         if !attr.is_dir() {
             return ax_err!(NotADirectory);
@@ -327,7 +484,7 @@ impl Directory {
             return ax_err!(PermissionDenied);
         }
 
-        node.open()?;
+        node.open(0)?;
         Ok(Self {
             node: WithCap::new(node, access_cap),
             entry_idx: 0,
@@ -356,18 +513,18 @@ impl Directory {
 
     /// Opens a file at the path relative to this directory. Returns a [`File`]
     /// object.
-    pub fn open_file_at(&self, path: &str, opts: &OpenOptions, fs: &FsStruct) -> AxResult<File> {
-        File::_open_at(self.access_at(path)?, path, opts, fs)
+    pub fn open_file_at(&self, path: &str, opts: &OpenOptions, fs: &FsStruct, uid: u32, gid: u32) -> AxResult<File> {
+        File::_open_at(self.access_at(path)?, path, opts, fs, uid, gid)
     }
 
     /// Creates an empty file at the path relative to this directory.
-    pub fn create_file(&self, path: &str, fs: &FsStruct) -> AxResult<VfsNodeRef> {
-        fs.create_file(self.access_at(path)?, path)
+    pub fn create_file(&self, path: &str, fs: &FsStruct, uid: u32, gid: u32, mode: i32) -> AxResult<VfsNodeRef> {
+        fs.create_file(self.access_at(path)?, path, VfsNodeType::File, uid, gid, mode)
     }
 
     /// Creates an empty directory at the path relative to this directory.
-    pub fn create_dir(&self, path: &str, fs: &FsStruct) -> AxResult {
-        fs.create_dir(self.access_at(path)?, path)
+    pub fn create_dir(&self, path: &str, fs: &FsStruct, uid: u32, gid: u32) -> AxResult {
+        fs.create_dir(self.access_at(path)?, path, uid, gid, 0o777)
     }
 
     /// Removes a file at the path relative to this directory.
